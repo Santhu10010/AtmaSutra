@@ -3,18 +3,49 @@ import math
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
+from scipy.stats import permutation_test, rankdata, spearmanr
 import httpx
 
 from db import get_conn
 
 METRIC_COLS = ["sleep_hours", "sleep_score", "recovery_score", "resting_hr"]
+OLLAMA_TIMEOUT_SECONDS = 60
+PERMUTATION_MAX_ROWS = 500
 SUGGESTIONS = {
     "late_dinner": "Try finishing dinner earlier and see whether the pattern repeats.",
     "alcohol_drinks": "Try fewer drinks and compare several similar nights.",
     "exercise_min": "Compare similar days before treating this as a personal pattern.",
     "screen_before_bed_hrs": "Try reducing evening screen time and compare several nights.",
 }
+
+
+def _spearman_test(x: pd.Series, y: pd.Series) -> tuple[float, float]:
+    """Return Spearman correlation with a p-value suitable for the sample size."""
+    if len(x) > PERMUTATION_MAX_ROWS:
+        result = spearmanr(x, y)
+        return float(result.statistic), float(result.pvalue)
+
+    x_ranks = rankdata(x.to_numpy())
+    y_ranks = rankdata(y.to_numpy())
+    y_centered = y_ranks - y_ranks.mean()
+
+    def statistic(sample, axis):
+        centered = sample - np.mean(sample, axis=axis, keepdims=True)
+        return np.sum(centered * y_centered, axis=axis) / np.sqrt(
+            np.sum(centered ** 2, axis=axis) * np.sum(y_centered ** 2)
+        )
+
+    result = permutation_test(
+        (x_ranks,),
+        statistic,
+        permutation_type="pairings",
+        vectorized=True,
+        n_resamples=9999,
+        batch=256,
+        alternative="two-sided",
+        rng=42,
+    )
+    return float(result.statistic), float(result.pvalue)
 
 def compute_insights():
     conn = get_conn()
@@ -51,11 +82,11 @@ def compute_insights():
             if len(x) < 5 or x.nunique() < 2 or y.nunique() < 2:
                 continue
 
-            r, p = spearmanr(x, y)
+            r, p = _spearman_test(x, y)
             if not math.isfinite(r) or not math.isfinite(p):
                 continue
             med = x.median()
-            if med == x.min():
+            if set(x.unique()).issubset({0.0, 1.0}):
                 high = y[x > 0].mean()
                 low = y[x == 0].mean()
             else:
@@ -70,8 +101,8 @@ def compute_insights():
             nudge = _make_nudge(habit, metric, delta)
             results.append({
                 "habit": habit, "metric": metric,
-                "correlation": round(r, 3), "p_value": round(p, 4),
-                "p_adjusted": round(adjusted_p, 4), "n": int(len(x)),
+                "correlation": round(r, 3), "p_value": float(p),
+                "p_adjusted": adjusted_p, "n": int(len(x)),
                 "delta": round(delta, 1), "delta_pct": round(delta_pct, 1),
                 "nudge": nudge,
             })
@@ -92,7 +123,7 @@ def _make_nudge(habit, metric, delta):
 async def try_ollama_nudge(insights: list[dict]) -> str | None:
     """Try local Ollama for AI summary. Returns None if unavailable."""
     summary_data = "\n".join(
-        f"- {i['habit']} -> {i['metric']}: r={i['correlation']}, adjusted p={i['p_adjusted']}"
+        f"- {i['habit']} -> {i['metric']}: r={i['correlation']}, adjusted p={i['p_adjusted']:.4g}"
         for i in insights[:6]
     )
     prompt = f"""You are a cautious health coach. These are associations, not proof of cause. Write 3 short experiment ideas (max 20 words each).
@@ -102,7 +133,8 @@ async def try_ollama_nudge(insights: list[dict]) -> str | None:
 Respond with just the 3 bullets."""
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        timeout = httpx.Timeout(OLLAMA_TIMEOUT_SECONDS, connect=2)
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             resp = await client.post("http://localhost:11434/api/generate", json={
                 "model": "llama3.2:3b", "prompt": prompt, "stream": False
             })

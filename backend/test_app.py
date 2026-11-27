@@ -1,7 +1,10 @@
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
+from unittest.mock import patch
 
+import pandas as pd
 from fastapi.testclient import TestClient
 
 import analytics
@@ -71,6 +74,57 @@ class AtmaSutraTests(unittest.TestCase):
                 self.assertEqual(self.upload(name, csv).status_code, 200)
         self.assertEqual(self.count("metrics"), 3)
 
+    def test_csv_rejects_missing_fields_and_invalid_known_habits(self):
+        samples = [
+            ("missing-date.csv", "date,sleep_score\n,88\n"),
+            ("blank-habit.csv", "date,habit,value\n2026-01-01,,30\n"),
+            ("invalid-habit.csv", "date,habit,value\n2026-01-01,late_dinner,9\n"),
+        ]
+        for name, csv in samples:
+            with self.subTest(name=name):
+                self.assertEqual(self.upload(name, csv).status_code, 400)
+        self.assertEqual(self.count("metrics"), 0)
+        self.assertEqual(self.count("habits"), 0)
+
+    def test_five_rows_do_not_claim_statistical_significance(self):
+        conn = db.get_conn()
+        try:
+            for offset in range(5):
+                habit_date = date(2026, 1, 1) + timedelta(days=offset)
+                value = offset + 1
+                conn.execute("INSERT INTO habits VALUES (?, 'custom_habit', ?)", (habit_date, value))
+                conn.execute(
+                    "INSERT INTO metrics VALUES (?, ?, ?, ?, ?, ?)",
+                    (habit_date + timedelta(days=1), 5 + value, 50 + value, 60 + value, 5, 70 - value),
+                )
+        finally:
+            conn.close()
+        insights = analytics.compute_insights()
+        self.assertEqual(len(insights), 4)
+        self.assertTrue(all(item["p_adjusted"] > 0.05 for item in insights))
+
+    def test_nonzero_habit_values_produce_an_insight(self):
+        conn = db.get_conn()
+        try:
+            for offset, (value, score) in enumerate(zip([10, 10, 10, 20, 30], [50, 51, 52, 80, 95])):
+                habit_date = date(2026, 3, 1) + timedelta(days=offset)
+                conn.execute("INSERT INTO habits VALUES (?, 'exercise_min', ?)", (habit_date, value))
+                conn.execute(
+                    "INSERT INTO metrics VALUES (?, ?, ?, ?, ?, ?)",
+                    (habit_date + timedelta(days=1), 7, score, 70, 5, 55),
+                )
+        finally:
+            conn.close()
+        insights = analytics.compute_insights()
+        self.assertTrue(any(item["metric"] == "sleep_score" for item in insights))
+
+    def test_large_samples_skip_expensive_permutations(self):
+        values = pd.Series(range(501))
+        with patch.object(analytics, "permutation_test", side_effect=AssertionError):
+            correlation, p_value = analytics._spearman_test(values, values)
+        self.assertEqual(correlation, 1.0)
+        self.assertLess(p_value, 0.05)
+
     def test_constant_habit_is_skipped(self):
         conn = db.get_conn()
         try:
@@ -102,6 +156,17 @@ class AtmaSutraTests(unittest.TestCase):
             },
         )
         self.assertEqual(response.headers["access-control-allow-origin"], "http://127.0.0.1:3000")
+
+    def test_concurrent_first_access_initializes_schema_once(self):
+        def connect(_):
+            conn = db.get_conn()
+            conn.close()
+
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            list(pool.map(connect, range(50)))
+
+        self.assertEqual(self.count("metrics"), 0)
+        self.assertEqual(self.count("habits"), 0)
 
 
 if __name__ == "__main__":
